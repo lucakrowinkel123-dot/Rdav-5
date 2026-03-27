@@ -58,6 +58,8 @@ struct TargetPacket
     public Vector3D TargetPosition;
     public Vector3D TargetVelocity;
     public Vector3D SourcePosition;
+    public Vector3D SourceForward;
+    public Vector3D SourceUp;
     public long TargetId;
     public string SourceName;
     public double Timestamp;
@@ -933,6 +935,8 @@ bool TryGetLocalPacket(out TargetPacket packet)
     packet.TargetPosition = targetPosition;
     packet.TargetVelocity = targetVelocity;
     packet.SourcePosition = Me.GetPosition();
+    packet.SourceForward = Me.WorldMatrix.Forward;
+    packet.SourceUp = Me.WorldMatrix.Up;
     packet.TargetId = 0;
     packet.SourceName = "local";
     packet.Timestamp = elapsedSeconds;
@@ -967,6 +971,8 @@ TargetPacket BuildNoTargetPacket()
     packet.TargetPosition = Vector3D.Zero;
     packet.TargetVelocity = Vector3D.Zero;
     packet.SourcePosition = Me.GetPosition();
+    packet.SourceForward = Me.WorldMatrix.Forward;
+    packet.SourceUp = Me.WorldMatrix.Up;
     packet.TargetId = 0;
     packet.SourceName = targetSourceMode == TargetSourceMode.Remote ? GetSelectedRemoteNameOrDefault() : "local";
     packet.Timestamp = elapsedSeconds;
@@ -1023,6 +1029,7 @@ void SelectRemoteByName(string name)
 
 string EncodeTargetPacket(TargetPacket packet)
 {
+    return $"{TARGET_PACKET_HEADER}|{TARGET_PACKET_VERSION}|{(packet.HasTarget ? 1 : 0)}|{packet.TargetPosition.X:0.###}|{packet.TargetPosition.Y:0.###}|{packet.TargetPosition.Z:0.###}|{packet.TargetVelocity.X:0.###}|{packet.TargetVelocity.Y:0.###}|{packet.TargetVelocity.Z:0.###}|{packet.SourcePosition.X:0.###}|{packet.SourcePosition.Y:0.###}|{packet.SourcePosition.Z:0.###}|{packet.TargetId}|{packet.SourceName}|{packet.Timestamp:0.###}|{packet.SourceForward.X:0.###}|{packet.SourceForward.Y:0.###}|{packet.SourceForward.Z:0.###}|{packet.SourceUp.X:0.###}|{packet.SourceUp.Y:0.###}|{packet.SourceUp.Z:0.###}";
     return $"{TARGET_PACKET_HEADER}|{TARGET_PACKET_VERSION}|{(packet.HasTarget ? 1 : 0)}|{packet.TargetPosition.X:0.###}|{packet.TargetPosition.Y:0.###}|{packet.TargetPosition.Z:0.###}|{packet.TargetVelocity.X:0.###}|{packet.TargetVelocity.Y:0.###}|{packet.TargetVelocity.Z:0.###}|{packet.SourcePosition.X:0.###}|{packet.SourcePosition.Y:0.###}|{packet.SourcePosition.Z:0.###}|{packet.TargetId}|{packet.SourceName}|{packet.Timestamp:0.###}";
 }
 
@@ -1060,6 +1067,23 @@ bool TryParseTargetPacket(string payload, out TargetPacket packet)
     packet.TargetId = targetId;
     packet.SourceName = parts[13];
     packet.Timestamp = timestamp;
+    packet.SourceForward = Vector3D.Forward;
+    packet.SourceUp = Vector3D.Up;
+
+    if (parts.Length >= 21)
+    {
+        double fx, fy, fz, ux, uy, uz;
+        if (double.TryParse(parts[15], out fx) &&
+            double.TryParse(parts[16], out fy) &&
+            double.TryParse(parts[17], out fz) &&
+            double.TryParse(parts[18], out ux) &&
+            double.TryParse(parts[19], out uy) &&
+            double.TryParse(parts[20], out uz))
+        {
+            packet.SourceForward = Vector3D.Normalize(new Vector3D(fx, fy, fz));
+            packet.SourceUp = Vector3D.Normalize(new Vector3D(ux, uy, uz));
+        }
+    }
     return true;
 }
 

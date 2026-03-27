@@ -77,6 +77,8 @@
   Vector3D ExternalTargetPosition = Vector3D.Zero;
   Vector3D ExternalTargetVelocity = Vector3D.Zero;
   Vector3D ExternalSourcePosition = Vector3D.Zero;
+  Vector3D ExternalSourceForward = Vector3D.Forward;
+  Vector3D ExternalSourceUp = Vector3D.Up;
   string ExternalSourceName = "none";
   long ExternalTargetId = 0;
 
@@ -1258,6 +1260,23 @@
       ExternalTargetPosition = new Vector3D(tx, ty, tz);
       ExternalTargetVelocity = new Vector3D(tvx, tvy, tvz);
       ExternalSourcePosition = new Vector3D(sx, sy, sz);
+      ExternalSourceForward = RC != null ? RC.WorldMatrix.Forward : Vector3D.Forward;
+      ExternalSourceUp = RC != null ? RC.WorldMatrix.Up : Vector3D.Up;
+
+      if (parts.Length >= 21)
+      {
+          double fx = 0, fy = 0, fz = 0, ux = 0, uy = 0, uz = 0;
+          if (double.TryParse(parts[15], out fx) &&
+              double.TryParse(parts[16], out fy) &&
+              double.TryParse(parts[17], out fz) &&
+              double.TryParse(parts[18], out ux) &&
+              double.TryParse(parts[19], out uy) &&
+              double.TryParse(parts[20], out uz))
+          {
+              ExternalSourceForward = Vector3D.Normalize(new Vector3D(fx, fy, fz));
+              ExternalSourceUp = Vector3D.Normalize(new Vector3D(ux, uy, uz));
+          }
+      }
       ExternalTargetId = parsedTargetId;
       ExternalSourceName = parts[13];
       return true;
@@ -1385,6 +1404,8 @@
 
           TrackingDisplay.RuntimeAgs runtimeAgs = new TrackingDisplay.RuntimeAgs();
           runtimeAgs.ReferenceLocation = ExternalFeedHasTarget ? ExternalSourcePosition : RC.GetPosition();
+          runtimeAgs.ReferenceForwards = ExternalFeedHasTarget ? ExternalSourceForward : RC.WorldMatrix.Forward;
+          runtimeAgs.ReferenceUpwards = ExternalFeedHasTarget ? ExternalSourceUp : RC.WorldMatrix.Up;
           runtimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
           runtimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
           runtimeAgs.TargetLock = HasTarget;
