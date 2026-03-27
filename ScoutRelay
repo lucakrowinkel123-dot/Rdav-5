@@ -1,0 +1,175 @@
+// Space Engineers programmable block script
+// Vetile Scout Relay
+// Broadcasts target feed + scout position over IGC for Vetile to ingest.
+
+const string TAG = "#Vetile#";
+const string CHANNEL = "VETILE_SCOUT_TARGET";
+const string PACKET_HEADER = "VTARGET";
+const string PACKET_VERSION = "1";
+const double SEND_INTERVAL_SECONDS = 0.1;
+const int FORCE_CONFIG_EVERY_N_SENDS = 10;
+
+IMyFlightMovementBlock flightBlock;
+IMyOffensiveCombatBlock combatBlock;
+IMyShipController scoutController;
+double sendTimer;
+double elapsedSeconds;
+int sendCounter;
+Vector3D lastTargetPosition = Vector3D.Zero;
+Vector3D lastTargetVelocity = Vector3D.Zero;
+double lastTargetSeenAt = -9999;
+
+public Program()
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+    LoadBlocks();
+}
+
+public void Save() { }
+
+public void Main(string argument, UpdateType updateSource)
+{
+    elapsedSeconds += Runtime.TimeSinceLastRun.TotalSeconds;
+
+    if (!string.IsNullOrWhiteSpace(argument))
+    {
+        if (argument.Equals("refresh", StringComparison.OrdinalIgnoreCase))
+            LoadBlocks();
+        else if (argument.Equals("ping", StringComparison.OrdinalIgnoreCase))
+            Echo("pong");
+    }
+
+    sendTimer += Runtime.TimeSinceLastRun.TotalSeconds;
+    if (sendTimer < SEND_INTERVAL_SECONDS)
+        return;
+
+    sendTimer = 0;
+    sendCounter++;
+    if (sendCounter % FORCE_CONFIG_EVERY_N_SENDS == 0)
+        ConfigureAiBlocks();
+
+    var packet = BuildPacket();
+    IGC.SendBroadcastMessage(CHANNEL, packet, TransmissionDistance.TransmissionDistanceMax);
+    EchoStatus(packet);
+}
+
+void LoadBlocks()
+{
+    var flights = new List<IMyFlightMovementBlock>();
+    GridTerminalSystem.GetBlocksOfType(flights, b => NameHasTag(b.CustomName, TAG));
+    flightBlock = flights.Count > 0 ? flights[0] : null;
+
+    var combats = new List<IMyOffensiveCombatBlock>();
+    GridTerminalSystem.GetBlocksOfType(combats, b => NameHasTag(b.CustomName, TAG));
+    combatBlock = combats.Count > 0 ? combats[0] : null;
+
+    var controllers = new List<IMyShipController>();
+    GridTerminalSystem.GetBlocksOfType(controllers, b => NameHasTag(b.CustomName, TAG));
+    scoutController = controllers.Count > 0 ? controllers[0] : null;
+
+    ConfigureAiBlocks();
+}
+
+void ConfigureAiBlocks()
+{
+    if (flightBlock != null)
+    {
+        flightBlock.Enabled = false;
+        flightBlock.MinimalAltitude = 10;
+        flightBlock.PrecisionMode = false;
+        flightBlock.SpeedLimit = 400;
+        flightBlock.AlignToPGravity = false;
+        flightBlock.CollisionAvoidance = false;
+        flightBlock.ApplyAction("ActivateBehavior_On");
+    }
+
+    if (combatBlock != null)
+    {
+        combatBlock.Enabled = true;
+        combatBlock.UpdateTargetInterval = 4;
+        combatBlock.SearchEnemyComponent.TargetingLockOptions = VRage.Game.ModAPI.Ingame.MyGridTargetingRelationFiltering.Enemy;
+        combatBlock.SelectedAttackPattern = 3;
+        combatBlock.SetValue<long>("OffensiveCombatIntercept_GuidanceType", 0);
+        combatBlock.SetValueBool("OffensiveCombatIntercept_OverrideCollisionAvoidance", true);
+        combatBlock.ApplyAction("ActivateBehavior_On");
+        combatBlock.ApplyAction("SetTargetPriority_Largest");
+    }
+}
+
+string BuildPacket()
+{
+    bool hasTarget = false;
+    Vector3D targetPos = Vector3D.Zero;
+    Vector3D targetVel = Vector3D.Zero;
+    long targetId = 0;
+
+    if (flightBlock != null && flightBlock.CurrentWaypoint != null)
+    {
+        hasTarget = true;
+        targetPos = flightBlock.CurrentWaypoint.Matrix.Translation;
+        targetVel = (targetPos - lastTargetPosition) / Math.Max(0.001, SEND_INTERVAL_SECONDS);
+        lastTargetPosition = targetPos;
+        lastTargetVelocity = targetVel;
+        lastTargetSeenAt = elapsedSeconds;
+    }
+    else if ((elapsedSeconds - lastTargetSeenAt) <= 2.0)
+    {
+        // Short persistence window to tolerate occasional null waypoint frames.
+        hasTarget = true;
+        targetPos = lastTargetPosition;
+        targetVel = lastTargetVelocity;
+    }
+
+    Vector3D sourcePos = scoutController != null ? scoutController.GetPosition() : Me.GetPosition();
+    Vector3D sourceForward = scoutController != null ? scoutController.WorldMatrix.Forward : Me.WorldMatrix.Forward;
+    Vector3D sourceUp = scoutController != null ? scoutController.WorldMatrix.Up : Me.WorldMatrix.Up;
+    string sourceName = GetCallsign();
+
+    return string.Format(
+        "{0}|{1}|{2}|{3:0.###}|{4:0.###}|{5:0.###}|{6:0.###}|{7:0.###}|{8:0.###}|{9:0.###}|{10:0.###}|{11:0.###}|{12}|{13}|{14:0.###}|{15:0.###}|{16:0.###}|{17:0.###}|{18:0.###}|{19:0.###}|{20:0.###}",
+        PACKET_HEADER,
+        PACKET_VERSION,
+        hasTarget ? 1 : 0,
+        targetPos.X, targetPos.Y, targetPos.Z,
+        targetVel.X, targetVel.Y, targetVel.Z,
+        sourcePos.X, sourcePos.Y, sourcePos.Z,
+        targetId,
+        sourceName,
+        elapsedSeconds,
+        sourceForward.X, sourceForward.Y, sourceForward.Z,
+        sourceUp.X, sourceUp.Y, sourceUp.Z
+    );
+}
+
+string GetCallsign()
+{
+    string data = Me.CustomData ?? "";
+    string[] lines = data.Split('\n');
+    for (int i = 0; i < lines.Length; i++)
+    {
+        var line = lines[i].Trim();
+        if (line.StartsWith("Callsign=", StringComparison.OrdinalIgnoreCase))
+            return line.Substring("Callsign=".Length).Trim();
+    }
+
+    return Me.CustomName;
+}
+
+void EchoStatus(string packet)
+{
+    bool hasTarget = flightBlock != null && flightBlock.CurrentWaypoint != null;
+    Echo("Vetile Scout Relay");
+    Echo($"Tag: {TAG}");
+    Echo($"Callsign: {GetCallsign()}");
+    Echo($"Target: {(hasTarget ? "LOCK" : "NONE")}");
+    Echo($"TargetPersistAge: {(elapsedSeconds - lastTargetSeenAt):0.0}s");
+    Echo($"FlightAI: {(flightBlock != null ? "OK" : "MISSING")}");
+    Echo($"OffAI: {(combatBlock != null ? "OK" : "MISSING")}");
+    Echo($"Controller: {(scoutController != null ? "OK" : "MISSING")}");
+    Echo($"Last packet bytes: {packet.Length}");
+}
+
+bool NameHasTag(string name, string tag)
+{
+    return name != null && name.IndexOf(tag, StringComparison.OrdinalIgnoreCase) >= 0;
+}

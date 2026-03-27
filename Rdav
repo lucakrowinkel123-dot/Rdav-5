@@ -72,6 +72,15 @@
   int AutoLaunchTimer = 0;
   int GuiRefreshCounter = 0;
   const int GuiRefreshIntervalTicks = 15; //redraw every other tick to reduce UI overhead
+  const string ExternalTargetPacketHeader = "VTARGET";
+  bool ExternalFeedHasTarget = false;
+  Vector3D ExternalTargetPosition = Vector3D.Zero;
+  Vector3D ExternalTargetVelocity = Vector3D.Zero;
+  Vector3D ExternalSourcePosition = Vector3D.Zero;
+  Vector3D ExternalSourceForward = Vector3D.Forward;
+  Vector3D ExternalSourceUp = Vector3D.Up;
+  string ExternalSourceName = "none";
+  long ExternalTargetId = 0;
 
   //Shipside Required Blocks For Functionality
   RadarTrackingModule ThisTracker;
@@ -1220,10 +1229,66 @@
   }
   #endregion
 
+  bool TryApplyExternalTargetPacket(string argument)
+  {
+      if (string.IsNullOrWhiteSpace(argument))
+      { return false; }
+      if (!argument.StartsWith(ExternalTargetPacketHeader + "|"))
+      { return false; }
+
+      string[] parts = argument.Split('|');
+      if (parts.Length < 15)
+      { return true; }
+
+      int hasTargetInt = 0;
+      double tx = 0, ty = 0, tz = 0, tvx = 0, tvy = 0, tvz = 0, sx = 0, sy = 0, sz = 0;
+      long parsedTargetId = 0;
+
+      int.TryParse(parts[2], out hasTargetInt);
+      double.TryParse(parts[3], out tx);
+      double.TryParse(parts[4], out ty);
+      double.TryParse(parts[5], out tz);
+      double.TryParse(parts[6], out tvx);
+      double.TryParse(parts[7], out tvy);
+      double.TryParse(parts[8], out tvz);
+      double.TryParse(parts[9], out sx);
+      double.TryParse(parts[10], out sy);
+      double.TryParse(parts[11], out sz);
+      long.TryParse(parts[12], out parsedTargetId);
+
+      ExternalFeedHasTarget = hasTargetInt == 1;
+      ExternalTargetPosition = new Vector3D(tx, ty, tz);
+      ExternalTargetVelocity = new Vector3D(tvx, tvy, tvz);
+      ExternalSourcePosition = new Vector3D(sx, sy, sz);
+      ExternalSourceForward = RC != null ? RC.WorldMatrix.Forward : Vector3D.Forward;
+      ExternalSourceUp = RC != null ? RC.WorldMatrix.Up : Vector3D.Up;
+
+      if (parts.Length >= 21)
+      {
+          double fx = 0, fy = 0, fz = 0, ux = 0, uy = 0, uz = 0;
+          if (double.TryParse(parts[15], out fx) &&
+              double.TryParse(parts[16], out fy) &&
+              double.TryParse(parts[17], out fz) &&
+              double.TryParse(parts[18], out ux) &&
+              double.TryParse(parts[19], out uy) &&
+              double.TryParse(parts[20], out uz))
+          {
+              ExternalSourceForward = Vector3D.Normalize(new Vector3D(fx, fy, fz));
+              ExternalSourceUp = Vector3D.Normalize(new Vector3D(ux, uy, uz));
+          }
+      }
+      ExternalTargetId = parsedTargetId;
+      ExternalSourceName = parts[13];
+      return true;
+  }
+
   //Main Method
   #region Main Method
   void Main(string argument)
   {
+      if (TryApplyExternalTargetPacket(argument))
+      { return; }
+
       //Ifdebug
       //debug.RemoveDraw();
       Program_local = this;
@@ -1261,7 +1326,19 @@
       bool HasTarget = ThisTracker.IsTracking; //If Turret Detects Enemy
 
       //Updates Track Location
-      if (HasTarget)
+      if (ExternalFeedHasTarget)
+      {
+          HasTarget = true;
+          TrackedTargetLocation = ExternalTargetPosition;
+          TrackedTargetVelocity = ExternalTargetVelocity;
+          Lstrundata = "TARGET LOCKED (VETILE)\nID: " + ExternalTargetId + "\nSRC: " + ExternalSourceName;
+          Lstrundata += "\nBoost: " + ThisTracker.BoostMode;
+
+          AutoLaunchTimer++;
+          if (AutoLaunchTimer > TicksBetweenAutoLaunch && EnableAutoLaunch)
+          { argument = "Fire"; AutoLaunchTimer = 0; }
+      }
+      else if (HasTarget)
       {
           TrackedTargetLocation = ThisTracker.TargetPosition;
           TrackedTargetVelocity = ThisTracker.TargetVelocity;
@@ -1326,9 +1403,9 @@
           GuiRefreshCounter = 0;
 
           TrackingDisplay.RuntimeAgs runtimeAgs = new TrackingDisplay.RuntimeAgs();
-          runtimeAgs.ReferenceLocation = RC.GetPosition();
-          runtimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
-          runtimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
+          runtimeAgs.ReferenceLocation = ExternalFeedHasTarget ? ExternalSourcePosition : RC.GetPosition();
+          runtimeAgs.ReferenceForwards = ExternalFeedHasTarget ? ExternalSourceForward : RC.WorldMatrix.Forward;
+          runtimeAgs.ReferenceUpwards = ExternalFeedHasTarget ? ExternalSourceUp : RC.WorldMatrix.Up;
           runtimeAgs.TargetLock = HasTarget;
           runtimeAgs.Targetmode = "RDAR";
           runtimeAgs.Targetinfoline1 = ThisTracker.GetLine1Info();

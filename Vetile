@@ -25,6 +25,11 @@ const double WARHEAD_RANGE_CHECK_SECONDS = 10.0;
 const double WARHEAD_MAX_DISTANCE_METERS = 3000.0;
 const double SUMMARY_LCD_UPDATE_SECONDS = 0.5;
 const string ALERT_SOUND_NAME = "Alert 2";
+const string TARGET_PACKET_HEADER = "VTARGET";
+const string TARGET_PACKET_VERSION = "1";
+const string IGC_SCOUT_CHANNEL = "VETILE_SCOUT_TARGET";
+const double REMOTE_TARGET_STALE_SECONDS = 2.0;
+const string RDAV_STATUS_NONE = "NO_TARGET";
 
 enum ControllerState
 {
@@ -39,6 +44,33 @@ enum TargetPriorityMode
     Closest,
     Largest,
     Smallest
+}
+
+enum TargetSourceMode
+{
+    Local,
+    Remote
+}
+
+struct TargetPacket
+{
+    public bool HasTarget;
+    public Vector3D TargetPosition;
+    public Vector3D TargetVelocity;
+    public Vector3D SourcePosition;
+    public Vector3D SourceForward;
+    public Vector3D SourceUp;
+    public long TargetId;
+    public string SourceName;
+    public double Timestamp;
+}
+
+class RemoteSourceState
+{
+    public string SourceName;
+    public TargetPacket LastPacket;
+    public bool HasPacket;
+    public double LastReceivedAt;
 }
 
 class TagChannel
@@ -79,6 +111,13 @@ double fireAllElapsed;
 double warheadRangeCheckTimer;
 int warheadRangeCheckTagIndex;
 double summaryLcdTimer;
+IMyBroadcastListener scoutListener;
+TargetSourceMode targetSourceMode = TargetSourceMode.Local;
+Dictionary<string, RemoteSourceState> remoteSources = new Dictionary<string, RemoteSourceState>();
+List<string> remoteSourceOrder = new List<string>();
+int selectedRemoteIndex;
+TargetPacket activeTargetPacket;
+double activeTargetDistanceMeters = -1;
 
 public Program()
 {
@@ -91,6 +130,7 @@ public Program()
     LoadSummaryLcd();
     LoadAlertSoundBlock();
     LoadNavController();
+    RegisterScoutListener();
 }
 
 public void Save() { }
@@ -140,7 +180,35 @@ public void Main(string argument, UpdateType updateSource)
             ForceStartAll();
             return;
         }
+        else if (argument.Equals("source local", StringComparison.OrdinalIgnoreCase))
+        {
+            targetSourceMode = TargetSourceMode.Local;
+        }
+        else if (argument.Equals("source remote", StringComparison.OrdinalIgnoreCase))
+        {
+            targetSourceMode = TargetSourceMode.Remote;
+        }
+        else if (argument.Equals("source cycle", StringComparison.OrdinalIgnoreCase))
+        {
+            targetSourceMode = targetSourceMode == TargetSourceMode.Local ? TargetSourceMode.Remote : TargetSourceMode.Local;
+        }
+        else if (argument.Equals("remote list", StringComparison.OrdinalIgnoreCase))
+        {
+            EchoRemoteSources();
+            return;
+        }
+        else if (argument.Equals("remote next", StringComparison.OrdinalIgnoreCase))
+        {
+            SelectNextRemote();
+        }
+        else if (argument.StartsWith("remote ", StringComparison.OrdinalIgnoreCase))
+        {
+            SelectRemoteByName(argument.Substring("remote ".Length).Trim());
+        }
     }
+
+    PollScoutMessages();
+    ResolveAndForwardTarget();
 
     foreach (var kv in channels)
         UpdateChannel(kv.Value);
@@ -332,6 +400,10 @@ void UpdateSummaryLcd()
 
     var text = new StringBuilder();
     text.AppendLine($"Target Priority: {globalTargetMode}");
+    text.AppendLine($"Source Mode: {targetSourceMode}");
+    text.AppendLine($"Target ID: {(activeTargetPacket.HasTarget ? activeTargetPacket.TargetId.ToString() : RDAV_STATUS_NONE)}");
+    text.AppendLine($"Source: {activeTargetPacket.SourceName}");
+    text.AppendLine($"Distance: {(activeTargetDistanceMeters >= 0 ? activeTargetDistanceMeters.ToString("0") + "m" : "-")}");
     text.AppendLine();
 
     for (int i = 0; i < TAGS.Length; i++)
@@ -779,6 +851,241 @@ bool NameHasTag(string name, string tag)
     return name != null && name.IndexOf(tag, StringComparison.OrdinalIgnoreCase) >= 0;
 }
 
+void RegisterScoutListener()
+{
+    scoutListener = IGC.RegisterBroadcastListener(IGC_SCOUT_CHANNEL);
+    scoutListener.SetMessageCallback("scout");
+}
+
+void PollScoutMessages()
+{
+    if (scoutListener == null)
+        return;
+
+    while (scoutListener.HasPendingMessage)
+    {
+        var message = scoutListener.AcceptMessage();
+        string payload = message.Data as string;
+        if (string.IsNullOrWhiteSpace(payload))
+            continue;
+
+        TargetPacket parsed;
+        if (!TryParseTargetPacket(payload, out parsed))
+            continue;
+
+        string sourceName = string.IsNullOrWhiteSpace(parsed.SourceName) ? "unknown" : parsed.SourceName;
+        RemoteSourceState state;
+        if (!remoteSources.TryGetValue(sourceName, out state))
+        {
+            state = new RemoteSourceState();
+            state.SourceName = sourceName;
+            remoteSources[sourceName] = state;
+            remoteSourceOrder.Add(sourceName);
+            if (remoteSourceOrder.Count == 1)
+                selectedRemoteIndex = 0;
+        }
+
+        state.LastPacket = parsed;
+        state.LastReceivedAt = elapsedSeconds;
+        state.HasPacket = true;
+    }
+}
+
+void ResolveAndForwardTarget()
+{
+    TargetPacket packet;
+    bool hasPacket = targetSourceMode == TargetSourceMode.Remote
+        ? TryGetSelectedRemotePacket(out packet)
+        : TryGetLocalPacket(out packet);
+
+    if (!hasPacket)
+    {
+        packet = BuildNoTargetPacket();
+    }
+
+    activeTargetPacket = packet;
+    activeTargetDistanceMeters = packet.HasTarget ? Vector3D.Distance(Me.GetPosition(), packet.TargetPosition) : -1;
+
+    string encoded = EncodeTargetPacket(packet);
+    for (int i = 0; i < TAGS.Length; i++)
+    {
+        var ch = channels[TAGS[i]];
+        if (ch.FireTargetPb != null)
+            ch.FireTargetPb.TryRun(encoded);
+    }
+}
+
+bool TryGetLocalPacket(out TargetPacket packet)
+{
+    packet = BuildNoTargetPacket();
+
+    IMyFlightMovementBlock localFlight = null;
+    var flights = new List<IMyFlightMovementBlock>();
+    GridTerminalSystem.GetBlocksOfType(flights, b => NameHasTag(b.CustomName, SUMMARY_LCD_TAG));
+    if (flights.Count > 0)
+        localFlight = flights[0];
+
+    if (localFlight == null || localFlight.CurrentWaypoint == null)
+        return false;
+
+    Vector3D targetPosition = localFlight.CurrentWaypoint.Matrix.Translation;
+    Vector3D targetVelocity = Vector3D.Zero;
+
+    packet.HasTarget = true;
+    packet.TargetPosition = targetPosition;
+    packet.TargetVelocity = targetVelocity;
+    packet.SourcePosition = Me.GetPosition();
+    packet.SourceForward = Me.WorldMatrix.Forward;
+    packet.SourceUp = Me.WorldMatrix.Up;
+    packet.TargetId = 0;
+    packet.SourceName = "local";
+    packet.Timestamp = elapsedSeconds;
+    return true;
+}
+
+bool TryGetSelectedRemotePacket(out TargetPacket packet)
+{
+    packet = BuildNoTargetPacket();
+    if (remoteSourceOrder.Count == 0)
+        return false;
+
+    if (selectedRemoteIndex < 0 || selectedRemoteIndex >= remoteSourceOrder.Count)
+        selectedRemoteIndex = 0;
+
+    string key = remoteSourceOrder[selectedRemoteIndex];
+    RemoteSourceState state;
+    if (!remoteSources.TryGetValue(key, out state) || !state.HasPacket)
+        return false;
+
+    if ((elapsedSeconds - state.LastReceivedAt) > REMOTE_TARGET_STALE_SECONDS)
+        return false;
+
+    packet = state.LastPacket;
+    return packet.HasTarget;
+}
+
+TargetPacket BuildNoTargetPacket()
+{
+    TargetPacket packet = new TargetPacket();
+    packet.HasTarget = false;
+    packet.TargetPosition = Vector3D.Zero;
+    packet.TargetVelocity = Vector3D.Zero;
+    packet.SourcePosition = Me.GetPosition();
+    packet.SourceForward = Me.WorldMatrix.Forward;
+    packet.SourceUp = Me.WorldMatrix.Up;
+    packet.TargetId = 0;
+    packet.SourceName = targetSourceMode == TargetSourceMode.Remote ? GetSelectedRemoteNameOrDefault() : "local";
+    packet.Timestamp = elapsedSeconds;
+    return packet;
+}
+
+string GetSelectedRemoteNameOrDefault()
+{
+    if (remoteSourceOrder.Count == 0)
+        return "remote:none";
+
+    if (selectedRemoteIndex < 0 || selectedRemoteIndex >= remoteSourceOrder.Count)
+        selectedRemoteIndex = 0;
+
+    return remoteSourceOrder[selectedRemoteIndex];
+}
+
+void EchoRemoteSources()
+{
+    Echo($"Remote sources ({remoteSourceOrder.Count}):");
+    for (int i = 0; i < remoteSourceOrder.Count; i++)
+    {
+        string key = remoteSourceOrder[i];
+        RemoteSourceState state;
+        if (!remoteSources.TryGetValue(key, out state))
+            continue;
+        double age = elapsedSeconds - state.LastReceivedAt;
+        string selected = i == selectedRemoteIndex ? "*" : " ";
+        Echo($"{selected} {state.SourceName} age:{age:0.0}s");
+    }
+}
+
+void SelectNextRemote()
+{
+    if (remoteSourceOrder.Count == 0)
+        return;
+    selectedRemoteIndex = (selectedRemoteIndex + 1) % remoteSourceOrder.Count;
+}
+
+void SelectRemoteByName(string name)
+{
+    if (string.IsNullOrWhiteSpace(name))
+        return;
+
+    for (int i = 0; i < remoteSourceOrder.Count; i++)
+    {
+        if (remoteSourceOrder[i].Equals(name, StringComparison.OrdinalIgnoreCase))
+        {
+            selectedRemoteIndex = i;
+            return;
+        }
+    }
+}
+
+string EncodeTargetPacket(TargetPacket packet)
+{
+    return $"{TARGET_PACKET_HEADER}|{TARGET_PACKET_VERSION}|{(packet.HasTarget ? 1 : 0)}|{packet.TargetPosition.X:0.###}|{packet.TargetPosition.Y:0.###}|{packet.TargetPosition.Z:0.###}|{packet.TargetVelocity.X:0.###}|{packet.TargetVelocity.Y:0.###}|{packet.TargetVelocity.Z:0.###}|{packet.SourcePosition.X:0.###}|{packet.SourcePosition.Y:0.###}|{packet.SourcePosition.Z:0.###}|{packet.TargetId}|{packet.SourceName}|{packet.Timestamp:0.###}|{packet.SourceForward.X:0.###}|{packet.SourceForward.Y:0.###}|{packet.SourceForward.Z:0.###}|{packet.SourceUp.X:0.###}|{packet.SourceUp.Y:0.###}|{packet.SourceUp.Z:0.###}";
+}
+
+bool TryParseTargetPacket(string payload, out TargetPacket packet)
+{
+    packet = new TargetPacket();
+    var parts = payload.Split('|');
+    if (parts.Length < 15)
+        return false;
+    if (!parts[0].Equals(TARGET_PACKET_HEADER, StringComparison.OrdinalIgnoreCase))
+        return false;
+
+    int hasTargetInt;
+    if (!int.TryParse(parts[2], out hasTargetInt))
+        return false;
+    packet.HasTarget = hasTargetInt == 1;
+
+    double x, y, z, vx, vy, vz, sx, sy, sz, timestamp;
+    long targetId;
+    if (!double.TryParse(parts[3], out x)) return false;
+    if (!double.TryParse(parts[4], out y)) return false;
+    if (!double.TryParse(parts[5], out z)) return false;
+    if (!double.TryParse(parts[6], out vx)) return false;
+    if (!double.TryParse(parts[7], out vy)) return false;
+    if (!double.TryParse(parts[8], out vz)) return false;
+    if (!double.TryParse(parts[9], out sx)) return false;
+    if (!double.TryParse(parts[10], out sy)) return false;
+    if (!double.TryParse(parts[11], out sz)) return false;
+    if (!long.TryParse(parts[12], out targetId)) targetId = 0;
+    if (!double.TryParse(parts[14], out timestamp)) timestamp = elapsedSeconds;
+
+    packet.TargetPosition = new Vector3D(x, y, z);
+    packet.TargetVelocity = new Vector3D(vx, vy, vz);
+    packet.SourcePosition = new Vector3D(sx, sy, sz);
+    packet.TargetId = targetId;
+    packet.SourceName = parts[13];
+    packet.Timestamp = timestamp;
+    packet.SourceForward = Vector3D.Forward;
+    packet.SourceUp = Vector3D.Up;
+
+    if (parts.Length >= 21)
+    {
+        double fx, fy, fz, ux, uy, uz;
+        if (double.TryParse(parts[15], out fx) &&
+            double.TryParse(parts[16], out fy) &&
+            double.TryParse(parts[17], out fz) &&
+            double.TryParse(parts[18], out ux) &&
+            double.TryParse(parts[19], out uy) &&
+            double.TryParse(parts[20], out uz))
+        {
+            packet.SourceForward = Vector3D.Normalize(new Vector3D(fx, fy, fz));
+            packet.SourceUp = Vector3D.Normalize(new Vector3D(ux, uy, uz));
+        }
+    }
+    return true;
+}
+
 void ResetAll()
 {
     foreach (var kv in channels)
@@ -843,6 +1150,7 @@ double NormalizeToMinusPiToPi(double radians)
 void EchoSummary()
 {
     Echo("Rotor Projection Finisher (Multi-Tag)");
+    Echo($"Target feed: {targetSourceMode} | source={activeTargetPacket.SourceName} | id={(activeTargetPacket.HasTarget ? activeTargetPacket.TargetId.ToString() : RDAV_STATUS_NONE)} | dist={(activeTargetDistanceMeters >= 0 ? activeTargetDistanceMeters.ToString("0") + "m" : "-")}");
 
     for (int i = 0; i < TAGS.Length; i++)
     {
