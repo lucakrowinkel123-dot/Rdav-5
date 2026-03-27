@@ -1,0 +1,858 @@
+// Space Engineers programmable block script
+// Multi-tag controller: #A#, #B#, #C#, #D# handled at the same time.
+
+static readonly string[] TAGS = new[] { "#A#", "#B#", "#C#", "#D#" };
+
+const float BUILD_RPM = 6f;
+const float PARK_RPM_MIN = 1f;
+const float PARK_RPM_MAX = 6f;
+const float PARK_SLOWDOWN_DEG = 10f;
+const float PARK_TOLERANCE_DEG = 1.5f;
+const int START_SPIN_AT_REMAINING_BLOCKS = 180;
+const double RECHECK_INTERVAL_SECONDS = 1.0;
+const bool AUTO_ENABLE_PROJECTOR = true;
+const float TANK_FULL_THRESHOLD = 0.8f;
+const double TANK_SCAN_COOLDOWN_SECONDS = 2.0;
+const string SUMMARY_LCD_TAG = "#Vetile#";
+const double FIREALL_INTERVAL_SECONDS = 0.2;
+const int FIREALL_MAX_ATTEMPTS_PER_TAG = 10;
+const double FIREALL_MAX_SECONDS = 10.0;
+const double FIREALL_MAX_SPEED_MPS = 20.0;
+const double FIREALL_MAX_LATERAL_SPEED_MPS = 5.0;
+const double FIREALL_MAX_YAW_RATE_RAD = 0.35;
+const double SAFE_DETONATION_DISTANCE_METERS = 250.0;
+const double WARHEAD_RANGE_CHECK_SECONDS = 10.0;
+const double WARHEAD_MAX_DISTANCE_METERS = 3000.0;
+const double SUMMARY_LCD_UPDATE_SECONDS = 0.5;
+const string ALERT_SOUND_NAME = "Alert 2";
+
+enum ControllerState
+{
+    WaitingExact,
+    Spinning,
+    Parking,
+    Parked
+}
+
+enum TargetPriorityMode
+{
+    Closest,
+    Largest,
+    Smallest
+}
+
+class TagChannel
+{
+    public string Tag;
+    public IMyProjector Projector;
+    public IMyMotorStator Rotor;
+    public IMyShipWelder Welder;
+    public IMyProgrammableBlock FireTargetPb;
+    public List<IMyOffensiveCombatBlock> CombatBlocks = new List<IMyOffensiveCombatBlock>();
+    public List<IMyShipConnector> Connectors = new List<IMyShipConnector>();
+    public List<IMyGasTank> Tanks = new List<IMyGasTank>();
+    public List<IMyWarhead> RememberedWarheads = new List<IMyWarhead>();
+    public HashSet<long> RememberedWarheadIds = new HashSet<long>();
+
+    public ControllerState State = ControllerState.WaitingExact;
+    public double RecheckTimerSeconds;
+    public bool ConnectorAttemptDone;
+    public int ConnectorConnectedOnAttempt;
+    public bool TanksFilledCached;
+    public double LastTankScanTime = -9999;
+    public int FireAllAttempts;
+    public bool WasTanksFilled;
+
+    public TagChannel(string tag) { Tag = tag; }
+}
+
+Dictionary<string, TagChannel> channels = new Dictionary<string, TagChannel>();
+double elapsedSeconds;
+IMyTextPanel summaryLcd;
+IMySoundBlock alertSoundBlock;
+IMyShipController navController;
+TargetPriorityMode globalTargetMode = TargetPriorityMode.Largest;
+Queue<TagChannel> fireAllQueue = new Queue<TagChannel>();
+bool fireAllSequenceActive;
+double fireAllTimer;
+double fireAllElapsed;
+double warheadRangeCheckTimer;
+int warheadRangeCheckTagIndex;
+double summaryLcdTimer;
+
+public Program()
+{
+    Runtime.UpdateFrequency = UpdateFrequency.Update10;
+
+    for (int i = 0; i < TAGS.Length; i++)
+        channels[TAGS[i]] = new TagChannel(TAGS[i]);
+
+    LoadBlocksAll();
+    LoadSummaryLcd();
+    LoadAlertSoundBlock();
+    LoadNavController();
+}
+
+public void Save() { }
+
+public void Main(string argument, UpdateType updateSource)
+{
+    elapsedSeconds += Runtime.TimeSinceLastRun.TotalSeconds;
+
+    if (!string.IsNullOrWhiteSpace(argument))
+    {
+        if (argument.Equals("refresh", StringComparison.OrdinalIgnoreCase))
+        {
+            LoadBlocksAll();
+            LoadSummaryLcd();
+            LoadAlertSoundBlock();
+            LoadNavController();
+        }
+        else if (argument.Equals("reset", StringComparison.OrdinalIgnoreCase))
+            ResetAll();
+        else if (argument.Equals("fire", StringComparison.OrdinalIgnoreCase))
+        {
+            ForwardFireAll();
+            return;
+        }
+        else if (argument.Equals("fireall", StringComparison.OrdinalIgnoreCase))
+        {
+            StartFireAllSequence();
+            return;
+        }
+        else if (argument.Equals("scanwarheads", StringComparison.OrdinalIgnoreCase) || argument.Equals("scanwh", StringComparison.OrdinalIgnoreCase))
+        {
+            ScanAndRememberWarheadsAll();
+            return;
+        }
+        else if (argument.Equals("detonate", StringComparison.OrdinalIgnoreCase) || argument.Equals("boom", StringComparison.OrdinalIgnoreCase))
+        {
+            DetonateRememberedWarheadsAll();
+            return;
+        }
+        else if (argument.Equals("cycletarget", StringComparison.OrdinalIgnoreCase) || argument.Equals("target", StringComparison.OrdinalIgnoreCase))
+        {
+            CycleTargetPriorityAll();
+            return;
+        }
+        else if (argument.Equals("start", StringComparison.OrdinalIgnoreCase) || argument.Equals("forcestart", StringComparison.OrdinalIgnoreCase))
+        {
+            ForceStartAll();
+            return;
+        }
+    }
+
+    foreach (var kv in channels)
+        UpdateChannel(kv.Value);
+
+    if (fireAllSequenceActive)
+        ProcessFireAllSequence();
+
+    warheadRangeCheckTimer += Runtime.TimeSinceLastRun.TotalSeconds;
+    double warheadSliceSeconds = WARHEAD_RANGE_CHECK_SECONDS / Math.Max(1, TAGS.Length);
+    if (warheadRangeCheckTimer >= warheadSliceSeconds)
+    {
+        warheadRangeCheckTimer = 0;
+        AutoDetonateOutOfRangeWarheadsNextTag();
+    }
+
+    EchoSummary();
+
+    summaryLcdTimer += Runtime.TimeSinceLastRun.TotalSeconds;
+    if (summaryLcdTimer >= SUMMARY_LCD_UPDATE_SECONDS)
+    {
+        summaryLcdTimer = 0;
+        UpdateSummaryLcd();
+    }
+
+    UpdateRuntimeFrequency();
+}
+
+void ForceStartAll()
+{
+    int started = 0;
+
+    foreach (var kv in channels)
+    {
+        var ch = kv.Value;
+        if (ch.Projector == null || ch.Rotor == null || ch.Welder == null)
+            continue;
+
+        int remaining = ch.Projector.RemainingBlocks + ch.Projector.RemainingArmorBlocks;
+        if (remaining <= 0)
+            continue;
+
+        ch.State = ControllerState.Spinning;
+        ch.ConnectorAttemptDone = false;
+        ch.ConnectorConnectedOnAttempt = 0;
+        started++;
+    }
+
+    Echo($"Force start applied to {started} channel(s)");
+}
+
+void UpdateChannel(TagChannel ch)
+{
+    if (ch.Projector == null || ch.Rotor == null || ch.Welder == null)
+        return;
+
+    if (AUTO_ENABLE_PROJECTOR && !ch.Projector.Enabled)
+        ch.Projector.Enabled = true;
+
+    int remaining = ch.Projector.RemainingBlocks + ch.Projector.RemainingArmorBlocks;
+    bool isFinished = remaining <= 0;
+
+    if (!isFinished && ch.State == ControllerState.Parked)
+    {
+        ch.State = ControllerState.WaitingExact;
+        ch.ConnectorAttemptDone = false;
+        ch.ConnectorConnectedOnAttempt = 0;
+    }
+
+    if (isFinished && ch.State != ControllerState.Parking && ch.State != ControllerState.Parked)
+        BeginParkingState(ch);
+
+    switch (ch.State)
+    {
+        case ControllerState.WaitingExact:
+            RotorStopUnlocked(ch);
+            if (ShouldStartFromExactCount(ch, remaining, isFinished))
+                ch.State = ControllerState.Spinning;
+            break;
+
+        case ControllerState.Spinning:
+            if (isFinished)
+            {
+                BeginParkingState(ch);
+                break;
+            }
+
+            ch.Rotor.RotorLock = false;
+            ch.Rotor.TargetVelocityRPM = BUILD_RPM;
+            break;
+
+        case ControllerState.Parking:
+            if (ParkRotorAtZero(ch))
+                ch.State = ControllerState.Parked;
+            break;
+
+        case ControllerState.Parked:
+            ch.Rotor.TargetVelocityRPM = 0f;
+            ch.Rotor.RotorLock = false;
+            break;
+    }
+
+    // Keep welder active only during build spin phase, never during parking.
+    bool turning = ch.State == ControllerState.Spinning;
+    if (ch.Welder.Enabled != turning)
+        ch.Welder.Enabled = turning;
+
+    if (ch.State == ControllerState.Parked || ch.State == ControllerState.WaitingExact)
+        UpdateTankCache(ch, false);
+
+    if (ch.TanksFilledCached && !ch.WasTanksFilled && !fireAllSequenceActive)
+        PlayReadyAlert();
+
+    ch.WasTanksFilled = ch.TanksFilledCached;
+}
+
+void CycleTargetPriorityAll()
+{
+    globalTargetMode = NextTargetMode(globalTargetMode);
+
+    foreach (var kv in channels)
+        ApplyTargetPriority(kv.Value);
+
+    UpdateSummaryLcd();
+}
+
+TargetPriorityMode NextTargetMode(TargetPriorityMode current)
+{
+    if (current == TargetPriorityMode.Closest) return TargetPriorityMode.Largest;
+    if (current == TargetPriorityMode.Largest) return TargetPriorityMode.Smallest;
+    return TargetPriorityMode.Closest;
+}
+
+void ApplyTargetPriority(TagChannel ch)
+{
+    if (ch.CombatBlocks == null || ch.CombatBlocks.Count == 0)
+        return;
+
+    string action = "SetTargetPriority_Largest";
+    if (globalTargetMode == TargetPriorityMode.Closest) action = "SetTargetPriority_Closest";
+    if (globalTargetMode == TargetPriorityMode.Smallest) action = "SetTargetPriority_Smallest";
+
+    for (int i = 0; i < ch.CombatBlocks.Count; i++)
+    {
+        var block = ch.CombatBlocks[i];
+        if (block != null)
+            block.ApplyAction(action);
+    }
+}
+
+void LoadSummaryLcd()
+{
+    var lcds = new List<IMyTextPanel>();
+    GridTerminalSystem.GetBlocksOfType(lcds, b => b.CustomName != null && b.CustomName.IndexOf(SUMMARY_LCD_TAG, StringComparison.OrdinalIgnoreCase) >= 0);
+    summaryLcd = lcds.Count > 0 ? lcds[0] : null;
+}
+
+void LoadAlertSoundBlock()
+{
+    var sounds = new List<IMySoundBlock>();
+    GridTerminalSystem.GetBlocksOfType(sounds, b => b.CustomName != null && b.CustomName.IndexOf(SUMMARY_LCD_TAG, StringComparison.OrdinalIgnoreCase) >= 0);
+    alertSoundBlock = sounds.Count > 0 ? sounds[0] : null;
+}
+
+void LoadNavController()
+{
+    var controllers = new List<IMyShipController>();
+    GridTerminalSystem.GetBlocksOfType(controllers, b => b.CustomName != null && b.CustomName.IndexOf(SUMMARY_LCD_TAG, StringComparison.OrdinalIgnoreCase) >= 0);
+    navController = controllers.Count > 0 ? controllers[0] : null;
+}
+
+void PlayReadyAlert()
+{
+    if (alertSoundBlock == null)
+        return;
+
+    if (alertSoundBlock.SelectedSound != ALERT_SOUND_NAME)
+        alertSoundBlock.SelectedSound = ALERT_SOUND_NAME;
+
+    alertSoundBlock.Stop();
+    alertSoundBlock.Play();
+}
+
+void UpdateSummaryLcd()
+{
+    if (summaryLcd == null)
+        return;
+
+    summaryLcd.ContentType = VRage.Game.GUI.TextPanel.ContentType.TEXT_AND_IMAGE;
+
+    var text = new StringBuilder();
+    text.AppendLine($"Target Priority: {globalTargetMode}");
+    text.AppendLine();
+
+    for (int i = 0; i < TAGS.Length; i++)
+    {
+        var ch = channels[TAGS[i]];
+        int remaining = ch.Projector != null ? ch.Projector.RemainingBlocks + ch.Projector.RemainingArmorBlocks : -1;
+        string state = GetDisplayState(ch);
+
+        text.AppendLine(ch.Tag);
+        text.AppendLine($"state: {state}");
+        text.AppendLine($"Remaining: {remaining}");
+        text.AppendLine();
+    }
+
+    summaryLcd.WriteText(text.ToString(), false);
+}
+
+void AutoDetonateOutOfRangeWarheadsNextTag()
+{
+    if (TAGS.Length == 0)
+        return;
+
+    if (warheadRangeCheckTagIndex >= TAGS.Length)
+        warheadRangeCheckTagIndex = 0;
+
+    string tag = TAGS[warheadRangeCheckTagIndex];
+    int detonated = AutoDetonateOutOfRangeWarheads(channels[tag]);
+
+    warheadRangeCheckTagIndex++;
+
+    if (detonated > 0)
+        Echo($"Auto-detonated out-of-range warheads [{tag}]: {detonated}");
+}
+
+int AutoDetonateOutOfRangeWarheads(TagChannel ch)
+{
+    int detonated = 0;
+    double maxSq = WARHEAD_MAX_DISTANCE_METERS * WARHEAD_MAX_DISTANCE_METERS;
+
+    for (int i = ch.RememberedWarheads.Count - 1; i >= 0; i--)
+    {
+        var wh = ch.RememberedWarheads[i];
+        if (wh == null || wh.Closed)
+        {
+            ch.RememberedWarheads.RemoveAt(i);
+            continue;
+        }
+
+        if (wh.IsSameConstructAs(Me))
+            continue;
+
+        double distSq = Vector3D.DistanceSquared(wh.GetPosition(), Me.GetPosition());
+        if (distSq > maxSq)
+        {
+            wh.Detonate();
+            detonated++;
+        }
+    }
+
+    return detonated;
+}
+
+void ScanAndRememberWarheadsAll()
+{
+    int added = 0;
+    for (int i = 0; i < TAGS.Length; i++)
+        added += ScanAndRememberWarheads(channels[TAGS[i]]);
+
+    Echo($"Warheads remembered: +{added}");
+}
+
+int ScanAndRememberWarheads(TagChannel ch)
+{
+    var found = new List<IMyWarhead>();
+    GridTerminalSystem.GetBlocksOfType(found, b => NameHasTag(b.CustomName, ch.Tag));
+
+    int added = 0;
+    for (int i = 0; i < found.Count; i++)
+    {
+        var wh = found[i];
+        if (wh == null) continue;
+
+        if (ch.RememberedWarheadIds.Add(wh.EntityId))
+        {
+            ch.RememberedWarheads.Add(wh);
+            added++;
+        }
+    }
+
+    return added;
+}
+
+void DetonateRememberedWarheadsAll()
+{
+    int detonated = 0;
+
+    for (int i = 0; i < TAGS.Length; i++)
+        detonated += DetonateRememberedWarheads(channels[TAGS[i]]);
+
+    Echo($"Detonated remembered warheads: {detonated}");
+}
+
+int DetonateRememberedWarheads(TagChannel ch)
+{
+    int detonated = 0;
+
+    for (int i = ch.RememberedWarheads.Count - 1; i >= 0; i--)
+    {
+        var wh = ch.RememberedWarheads[i];
+        if (wh == null || wh.Closed)
+        {
+            ch.RememberedWarheads.RemoveAt(i);
+            continue;
+        }
+
+        // Never detonate warheads still attached to this construct.
+        if (wh.IsSameConstructAs(Me))
+            continue;
+
+        // Safety: do not detonate if within 1km of this PB.
+        double distSq = Vector3D.DistanceSquared(wh.GetPosition(), Me.GetPosition());
+        if (distSq < SAFE_DETONATION_DISTANCE_METERS * SAFE_DETONATION_DISTANCE_METERS)
+            continue;
+
+        wh.Detonate();
+        detonated++;
+    }
+
+    return detonated;
+}
+
+string GetDisplayState(TagChannel ch)
+{
+    // Always show active movement states directly.
+    if (ch.State == ControllerState.Spinning || ch.State == ControllerState.Parking)
+        return ch.State.ToString();
+
+    // Only show readiness when idle.
+    if (ch.TanksFilledCached)
+        return "Ready";
+
+    return "Fueling";
+}
+
+void StartFireAllSequence()
+{
+    fireAllQueue.Clear();
+    fireAllElapsed = 0;
+    ScanAndRememberWarheadsAll();
+
+    for (int i = 0; i < TAGS.Length; i++)
+    {
+        var ch = channels[TAGS[i]];
+        ch.FireAllAttempts = 0;
+    ch.WasTanksFilled = false;
+        fireAllQueue.Enqueue(ch);
+    }
+
+    fireAllSequenceActive = fireAllQueue.Count > 0;
+    fireAllTimer = FIREALL_INTERVAL_SECONDS;
+    UpdateRuntimeFrequency();
+}
+
+void ProcessFireAllSequence()
+{
+    if (!fireAllSequenceActive)
+        return;
+
+    double dt = Runtime.TimeSinceLastRun.TotalSeconds;
+    fireAllTimer += dt;
+    fireAllElapsed += dt;
+
+    if (fireAllTimer < FIREALL_INTERVAL_SECONDS)
+        return;
+
+    if (!CanRunFireAllAtCurrentMotion())
+    {
+        AbortFireAllSequence("aborted: motion limits exceeded");
+        return;
+    }
+
+    fireAllTimer = 0;
+
+    while (fireAllQueue.Count > 0)
+    {
+        var ch = fireAllQueue.Dequeue();
+
+        if (ch.State == ControllerState.Spinning)
+            continue;
+
+        if (ch.FireAllAttempts >= FIREALL_MAX_ATTEMPTS_PER_TAG)
+            continue;
+
+        TryForwardFire(ch, true);
+        ch.FireAllAttempts++;
+        break;
+    }
+
+    if (fireAllQueue.Count == 0)
+    {
+        if (AllChannelsSpinning() || fireAllElapsed >= FIREALL_MAX_SECONDS)
+        {
+            fireAllSequenceActive = false;
+            UpdateRuntimeFrequency();
+            return;
+        }
+
+        // Continue firing channels that still are not spinning.
+        for (int i = 0; i < TAGS.Length; i++)
+        {
+            var ch = channels[TAGS[i]];
+            if (ch.State != ControllerState.Spinning && ch.FireAllAttempts < FIREALL_MAX_ATTEMPTS_PER_TAG)
+                fireAllQueue.Enqueue(ch);
+        }
+
+        if (fireAllQueue.Count == 0)
+        {
+            fireAllSequenceActive = false;
+            UpdateRuntimeFrequency();
+        }
+    }
+}
+
+bool AllChannelsSpinning()
+{
+    for (int i = 0; i < TAGS.Length; i++)
+    {
+        if (channels[TAGS[i]].State != ControllerState.Spinning)
+            return false;
+    }
+    return true;
+}
+
+void UpdateRuntimeFrequency()
+{
+    Runtime.UpdateFrequency = fireAllSequenceActive
+        ? (UpdateFrequency.Update10 | UpdateFrequency.Update1)
+        : UpdateFrequency.Update10;
+}
+
+void AbortFireAllSequence(string reason)
+{
+    fireAllSequenceActive = false;
+    fireAllQueue.Clear();
+    UpdateRuntimeFrequency();
+    Echo($"FireAll {reason}");
+}
+
+void ForwardFireAll()
+{
+    int sentCount = 0;
+
+    foreach (var kv in channels)
+    {
+        if (TryForwardFire(kv.Value, false))
+            sentCount++;
+    }
+
+    Echo($"Fire forwarded to {sentCount} channel(s)");
+}
+
+bool TryForwardFire(TagChannel ch, bool enforceFireAllMotionLimits)
+{
+    if (enforceFireAllMotionLimits && !CanRunFireAllAtCurrentMotion())
+        return false;
+
+    if (ch.Rotor == null || !IsRotorWithinParkTolerance(ch))
+        return false;
+
+    ch.State = ControllerState.Parked;
+
+    UpdateTankCache(ch, false);
+    if (!ch.TanksFilledCached)
+        return false;
+
+    if (ch.FireTargetPb == null)
+        return false;
+
+    return ch.FireTargetPb.TryRun("Fire");
+}
+
+bool CanRunFireAllAtCurrentMotion()
+{
+    // No tagged controller -> don't hard-block fireall.
+    if (navController == null)
+        return true;
+
+    var velocities = navController.GetShipVelocities();
+    if (velocities.LinearVelocity.Length() > FIREALL_MAX_SPEED_MPS)
+        return false;
+
+    MatrixD toLocal = MatrixD.Transpose(navController.WorldMatrix);
+    Vector3D localLinear = Vector3D.TransformNormal(velocities.LinearVelocity, toLocal);
+    if (Math.Abs(localLinear.X) > FIREALL_MAX_LATERAL_SPEED_MPS)
+        return false;
+
+    Vector3D localAngular = Vector3D.TransformNormal(velocities.AngularVelocity, toLocal);
+    if (Math.Abs(localAngular.Y) > FIREALL_MAX_YAW_RATE_RAD)
+        return false;
+
+    return true;
+}
+
+bool IsRotorWithinParkTolerance(TagChannel ch)
+{
+    double angle = NormalizeToMinusPiToPi(ch.Rotor.Angle);
+    double toleranceRad = MathHelper.ToRadians(PARK_TOLERANCE_DEG);
+    return Math.Abs(angle) <= toleranceRad;
+}
+
+void UpdateTankCache(TagChannel ch, bool force)
+{
+    if (!force && (elapsedSeconds - ch.LastTankScanTime) < TANK_SCAN_COOLDOWN_SECONDS)
+        return;
+
+    RefreshTaggedTanks(ch);
+    ch.TanksFilledCached = AreTaggedTanksFilled(ch);
+    ch.LastTankScanTime = elapsedSeconds;
+}
+
+bool AreTaggedTanksFilled(TagChannel ch)
+{
+    if (ch.Tanks.Count == 0)
+        return false;
+
+    for (int i = 0; i < ch.Tanks.Count; i++)
+    {
+        var tank = ch.Tanks[i];
+        if (tank == null)
+            continue;
+
+        if (tank.FilledRatio < TANK_FULL_THRESHOLD)
+            return false;
+    }
+
+    return true;
+}
+
+void BeginParkingState(TagChannel ch)
+{
+    if (ch.State == ControllerState.Parking || ch.State == ControllerState.Parked)
+        return;
+
+    ch.State = ControllerState.Parking;
+
+    if (!ch.ConnectorAttemptDone)
+    {
+        RefreshTaggedConnectors(ch);
+        ch.ConnectorConnectedOnAttempt = LockTaggedConnectors(ch);
+        ch.ConnectorAttemptDone = true;
+    }
+}
+
+bool ShouldStartFromExactCount(TagChannel ch, int remaining, bool isFinished)
+{
+    if (isFinished)
+        return false;
+
+    ch.RecheckTimerSeconds += Runtime.TimeSinceLastRun.TotalSeconds;
+    if (ch.RecheckTimerSeconds < RECHECK_INTERVAL_SECONDS)
+        return false;
+
+    ch.RecheckTimerSeconds = 0;
+    return remaining == START_SPIN_AT_REMAINING_BLOCKS;
+}
+
+int LockTaggedConnectors(TagChannel ch)
+{
+    int lockedOrConnected = 0;
+
+    for (int i = 0; i < ch.Connectors.Count; i++)
+    {
+        var connector = ch.Connectors[i];
+        if (connector == null)
+            continue;
+
+        if (!connector.Enabled)
+            connector.Enabled = true;
+        connector.ThrowOut = false;
+
+        if (connector.Status != MyShipConnectorStatus.Connected)
+            connector.Connect();
+
+        if (connector.Status == MyShipConnectorStatus.Connected)
+            lockedOrConnected++;
+    }
+
+    return lockedOrConnected;
+}
+
+void RefreshTaggedConnectors(TagChannel ch)
+{
+    ch.Connectors.Clear();
+    GridTerminalSystem.GetBlocksOfType(ch.Connectors, b => NameHasTag(b.CustomName, ch.Tag));
+}
+
+void RefreshTaggedTanks(TagChannel ch)
+{
+    ch.Tanks.Clear();
+    GridTerminalSystem.GetBlocksOfType(ch.Tanks, b => NameHasTag(b.CustomName, ch.Tag));
+}
+
+void LoadBlocksAll()
+{
+    foreach (var kv in channels)
+        LoadBlocksForChannel(kv.Value);
+}
+
+void LoadBlocksForChannel(TagChannel ch)
+{
+    var projectors = new List<IMyProjector>();
+    var rotors = new List<IMyMotorStator>();
+    ch.CombatBlocks.Clear();
+    var welders = new List<IMyShipWelder>();
+    var taggedPbs = new List<IMyProgrammableBlock>();
+
+    GridTerminalSystem.GetBlocksOfType(projectors, b => NameHasTag(b.CustomName, ch.Tag));
+    GridTerminalSystem.GetBlocksOfType(rotors, b => NameHasTag(b.CustomName, ch.Tag));
+    GridTerminalSystem.GetBlocksOfType(welders, b => NameHasTag(b.CustomName, ch.Tag));
+    GridTerminalSystem.GetBlocksOfType(taggedPbs, b => NameHasTag(b.CustomName, ch.Tag));
+    GridTerminalSystem.GetBlocksOfType(ch.CombatBlocks, b => NameHasTag(b.CustomName, ch.Tag));
+
+    ch.Projector = projectors.Count > 0 ? projectors[0] : null;
+    ch.Rotor = rotors.Count > 0 ? rotors[0] : null;
+    ch.Welder = welders.Count > 0 ? welders[0] : null;
+    ch.FireTargetPb = null;
+
+    for (int i = 0; i < taggedPbs.Count; i++)
+    {
+        if (taggedPbs[i] != null && taggedPbs[i].EntityId != Me.EntityId)
+        {
+            ch.FireTargetPb = taggedPbs[i];
+            break;
+        }
+    }
+
+    RefreshTaggedConnectors(ch);
+    UpdateTankCache(ch, true);
+    ch.WasTanksFilled = ch.TanksFilledCached;
+    ApplyTargetPriority(ch);
+}
+
+bool NameHasTag(string name, string tag)
+{
+    return name != null && name.IndexOf(tag, StringComparison.OrdinalIgnoreCase) >= 0;
+}
+
+void ResetAll()
+{
+    foreach (var kv in channels)
+        ResetChannel(kv.Value);
+}
+
+void ResetChannel(TagChannel ch)
+{
+    ch.State = ControllerState.WaitingExact;
+    ch.RecheckTimerSeconds = 0;
+    ch.ConnectorAttemptDone = false;
+    ch.ConnectorConnectedOnAttempt = 0;
+    ch.TanksFilledCached = false;
+    ch.LastTankScanTime = -9999;
+    ch.FireAllAttempts = 0;
+    ch.WasTanksFilled = false;
+    ch.RememberedWarheads.Clear();
+    ch.RememberedWarheadIds.Clear();
+
+    RotorStopUnlocked(ch);
+    if (ch.Welder != null)
+        ch.Welder.Enabled = false;
+}
+
+void RotorStopUnlocked(TagChannel ch)
+{
+    if (ch.Rotor == null) return;
+    ch.Rotor.TargetVelocityRPM = 0f;
+    ch.Rotor.RotorLock = false;
+}
+
+bool ParkRotorAtZero(TagChannel ch)
+{
+    double angle = NormalizeToMinusPiToPi(ch.Rotor.Angle);
+    double toleranceRad = MathHelper.ToRadians(PARK_TOLERANCE_DEG);
+
+    if (Math.Abs(angle) <= toleranceRad)
+    {
+        ch.Rotor.TargetVelocityRPM = 0f;
+        ch.Rotor.RotorLock = false;
+        return true;
+    }
+
+    ch.Rotor.RotorLock = false;
+    float direction = angle > 0 ? -1f : 1f;
+
+    double slowdownRad = MathHelper.ToRadians(PARK_SLOWDOWN_DEG);
+    double ratio = slowdownRad <= 0 ? 1 : Math.Min(1, Math.Abs(angle) / slowdownRad);
+    float parkRpm = (float)(PARK_RPM_MIN + (PARK_RPM_MAX - PARK_RPM_MIN) * ratio);
+
+    ch.Rotor.TargetVelocityRPM = parkRpm * direction;
+    return false;
+}
+
+double NormalizeToMinusPiToPi(double radians)
+{
+    while (radians > Math.PI) radians -= Math.PI * 2;
+    while (radians < -Math.PI) radians += Math.PI * 2;
+    return radians;
+}
+
+void EchoSummary()
+{
+    Echo("Rotor Projection Finisher (Multi-Tag)");
+
+    for (int i = 0; i < TAGS.Length; i++)
+    {
+        var ch = channels[TAGS[i]];
+        string ok = (ch.Projector != null && ch.Rotor != null && ch.Welder != null) ? "OK" : "MISSING";
+        Echo($"{ch.Tag}: {ch.State} | {ok} | Target {globalTargetMode} | Tanks {ch.Tanks.Count} {(ch.TanksFilledCached ? "FULL" : "WAIT")} | Conn {ch.Connectors.Count} | WH {ch.RememberedWarheads.Count}");
+    }
+
+    if (navController == null)
+        Echo("FireAll motion guard: no tagged ship controller (#Vetile#)");
+    else
+        Echo($"FireAll limits: speed<={FIREALL_MAX_SPEED_MPS:0}m/s lateral<={FIREALL_MAX_LATERAL_SPEED_MPS:0}m/s yaw<={FIREALL_MAX_YAW_RATE_RAD:0.00}rad/s");
+}
