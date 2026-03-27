@@ -1030,6 +1030,7 @@ void SelectRemoteByName(string name)
 string EncodeTargetPacket(TargetPacket packet)
 {
     return $"{TARGET_PACKET_HEADER}|{TARGET_PACKET_VERSION}|{(packet.HasTarget ? 1 : 0)}|{packet.TargetPosition.X:0.###}|{packet.TargetPosition.Y:0.###}|{packet.TargetPosition.Z:0.###}|{packet.TargetVelocity.X:0.###}|{packet.TargetVelocity.Y:0.###}|{packet.TargetVelocity.Z:0.###}|{packet.SourcePosition.X:0.###}|{packet.SourcePosition.Y:0.###}|{packet.SourcePosition.Z:0.###}|{packet.TargetId}|{packet.SourceName}|{packet.Timestamp:0.###}|{packet.SourceForward.X:0.###}|{packet.SourceForward.Y:0.###}|{packet.SourceForward.Z:0.###}|{packet.SourceUp.X:0.###}|{packet.SourceUp.Y:0.###}|{packet.SourceUp.Z:0.###}";
+    return $"{TARGET_PACKET_HEADER}|{TARGET_PACKET_VERSION}|{(packet.HasTarget ? 1 : 0)}|{packet.TargetPosition.X:0.###}|{packet.TargetPosition.Y:0.###}|{packet.TargetPosition.Z:0.###}|{packet.TargetVelocity.X:0.###}|{packet.TargetVelocity.Y:0.###}|{packet.TargetVelocity.Z:0.###}|{packet.SourcePosition.X:0.###}|{packet.SourcePosition.Y:0.###}|{packet.SourcePosition.Z:0.###}|{packet.TargetId}|{packet.SourceName}|{packet.Timestamp:0.###}";
 }
 
 bool TryParseTargetPacket(string payload, out TargetPacket packet)

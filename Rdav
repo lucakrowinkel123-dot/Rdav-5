@@ -1406,6 +1406,8 @@
           runtimeAgs.ReferenceLocation = ExternalFeedHasTarget ? ExternalSourcePosition : RC.GetPosition();
           runtimeAgs.ReferenceForwards = ExternalFeedHasTarget ? ExternalSourceForward : RC.WorldMatrix.Forward;
           runtimeAgs.ReferenceUpwards = ExternalFeedHasTarget ? ExternalSourceUp : RC.WorldMatrix.Up;
+          runtimeAgs.ReferenceForwards = RC.WorldMatrix.Forward;
+          runtimeAgs.ReferenceUpwards = RC.WorldMatrix.Up;
           runtimeAgs.TargetLock = HasTarget;
           runtimeAgs.Targetmode = "RDAR";
           runtimeAgs.Targetinfoline1 = ThisTracker.GetLine1Info();
